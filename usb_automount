@@ -1,0 +1,241 @@
+#!/usr/bin/env python3
+
+"""
+Tutorial to automount a usb: https://wiki.archlinux.org/title/udev
+
+This python script is a translation of the shell script `media-automount`
+from github repo 'https://github.com/Ferk/udev-media-automount'.
+include: 
+ - /usr/lib/systemd/system/media-automount@.service
+ - /usr/lib/udev/rules.d/99-media-automount.rules
+ - /usr/bin/usb_automount
+deploy:
+ - udevadm control --reload-rules
+ - systemctl daemon-reload
+monitor:
+- udevadm monitor -u -s block
+- journalctl -f
+
+Find usb serial with 'udevadm info -a  -n /dev/<DISC> | grep -i serial'
+
+Usage:
+    usb_automount [--debug] <dev>
+    usb_automount --version
+    usb_automount (-h|--help)
+
+Options:
+    -d, --debug
+        Print debug information.
+    -V, --version
+        Print version
+    -h, --help
+        Print this help message
+"""
+import os
+import stat
+import sys
+import subprocess
+import logging
+
+from docopt import docopt
+
+# Name of the script
+NAME = os.path.basename(sys.argv[0])
+VERSION = "0.1"
+
+# /dev/ dir
+DEV_DIR = "/dev"
+
+FSTAB_FILE = "/etc/fstab"
+
+MTAB_FILE = "/etc/mtab"
+
+# Default options to use for mounting
+AUTOMOUNT_OPTS = 'users'
+# Default type to use for mounting
+AUTOMOUNT_TYPE = 'auto'
+
+# Directory to look for type-specific settings
+CONFDIR = '/etc/media-automount.d'
+
+# Directory to use as parent media dir for mountpoints
+MEDIADIR = '/media'
+
+logging.basicConfig(format='%(message)s')
+log = logging.getLogger(NAME)
+log.setLevel(logging.INFO)
+
+
+def execute(cmd: str, **kwargs) -> subprocess.run:
+    cmd_list = cmd.split()
+    log.debug("Execute>>> %s", cmd_list)
+    return subprocess.run(cmd_list, shell=False, check=False,
+                          stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                          **kwargs)
+
+
+def check_root_permissions() -> None:
+    """
+    sys.exit(1): when user is non root
+    """
+    if os.geteuid() != 0:
+        log.error("This tool requires root permissions.")
+        sys.exit(1)
+
+
+# TODO: unused
+# def check_device_arg() -> str:
+#     if len(sys.argv) < 2:
+#         log.error("missing arguments! a device name must be provided.")
+#         sys.exit(1)
+#     return os.path.join(DEV_DIR, os.path.basename(sys.argv[1]))
+
+
+def check_root_fs(dev: str) -> None:
+    """
+    sys.exit(1) if dev is used as rootfs.
+    """
+    res = execute("findmnt -n -o SOURCE /")
+    root_dev = res.stdout.strip().decode("utf-8")
+    if dev in root_dev:
+        log.error("'%s' is used as rootfs, automount won't manage it.", dev)
+        sys.exit(1)
+
+
+def device_exists(dev: str) -> bool:
+    if os.path.exists(dev):
+        mode = os.stat(dev).st_mode
+        return stat.S_ISBLK(mode)
+    return False
+
+
+def unmount_device(dev: str) -> bool:
+    result = execute(f"umount {dev}")
+    if result.returncode != 0:
+        log.error("Error unmounting '%s' errcode: %s", dev, result.returncode)
+        log.error("Command was: umount '%s'", dev)
+    # Reverse output since 0 in linux means successful but failed in python
+    return not bool(result.returncode)
+
+
+def cleanup_mountpoints() -> None:
+    for d in os.listdir(MEDIADIR):
+        path = os.path.join(MEDIADIR, d)
+        if os.path.isdir(path) and not os.path.ismount(path) and not in_fstab(path):
+            os.rmdir(path)
+
+
+def in_fstab(path: str) -> bool:
+    with open(FSTAB_FILE, "r", encoding="utf-8") as fstab:
+        return any(line.split()[1] == path for line in fstab if line.strip() and not line.startswith('#'))
+
+
+def get_device_info(dev: str) -> dict:
+    result = execute(f"blkid -po export {dev}")
+    return dict(line.split('=') for line in result.stdout.decode("utf-8").strip().split('\n'))
+
+
+def already_in_fstab(uuid: str, label: str, dev: str) -> bool:
+    with open(FSTAB_FILE, "r", encoding="utf-8") as fstab:
+        for line in fstab:
+            if line.startswith('#') or not line.strip():
+                continue
+            if uuid and uuid in line:
+                return True
+            if label and label in line:
+                return True
+            if dev and dev in line:
+                return True
+    return False
+
+
+def get_mount_dir(label: str, dev_type: str) -> str:
+    base_dir = os.path.join(MEDIADIR, f"{label}.{dev_type}")
+    if os.path.exists(base_dir) and os.path.ismount(base_dir):
+        dups = len([d for d in os.listdir(MEDIADIR) if d.startswith(f"{label}.{dev_type}")])
+        return f"{base_dir}_{dups}"
+    return base_dir
+
+
+def load_fs_config(fs_type):
+    config_file = os.path.join(CONFDIR, fs_type)
+    if os.path.exists(config_file):
+        log.debug("loading configuration for fs type '%s'.", fs_type)
+        with open(config_file, "r", encoding="utf-8") as f:
+            import pdb; pdb.set_trace()
+            # pdb: check func typings and if execute works
+            cmd = f.read() 
+            res = execute(cmd)
+
+
+def mount_device(dev: str, mount_dir: str, opts: str, dev_type: str) -> None:
+    """
+    sys.exit(1) when mount failed
+    """
+    result = execute(f"mount -t {dev_type} -o {opts} {dev} {mount_dir}")
+    if result.returncode == 0:
+        notify_user(mount_dir)
+        log.debug("Device successfully mounted: %s", mount_dir)
+    else:
+        log.error("Mount error: %s", result.returncode)
+        log.error("Command was: 'mount -t %s -o %s %s %s'",
+                  dev_type, opts, dev, mount_dir)
+        os.rmdir(mount_dir)
+        sys.exit(1)
+
+
+def notify_user(mount_dir):
+    result = execute("ps au")
+    for line in result.stdout.decode("utf-8").splitlines():
+        if 'xinit' in line:
+            username = line.split()[0]
+            display = ':0'
+            execute(f"runuser -u {username} -- xdg-open {mount_dir}",
+                    env={'DISPLAY': display})
+            break
+
+
+def main():
+    args = docopt(__doc__,
+                  version=f"{NAME} version {VERSION}",
+                  options_first=True)
+
+    if args["--debug"]:
+        log.setLevel(logging.DEBUG)
+        log.debug(args)
+
+    dev = os.path.join(DEV_DIR, args["<dev>"])
+
+    check_root_permissions()
+    check_root_fs(dev)
+
+    if not device_exists(dev):
+        if execute(f"grep {dev} {MTAB_FILE}").returncode == 0:
+            log.debug("'%s' device removed, unmounting and cleaning '%s'",
+                      dev, MEDIADIR)
+            unmount_device(dev)
+        cleanup_mountpoints()
+        sys.exit(0)
+
+    device_info = get_device_info(dev)
+    if "TYPE" not in device_info:
+        log.debug("'%s' has no known filesystem type, ignoring mount request",
+                  dev)
+        sys.exit(0)
+
+    if already_in_fstab(device_info.get('UUID'), device_info.get('LABEL'), dev):
+        log.debug("'%s' already in /etc/fstab, automount won't manage it",
+                  dev)
+        sys.exit(0)
+
+    mount_dir = get_mount_dir(device_info.get('LABEL', os.path.basename(dev)),
+                              device_info['TYPE'])
+    os.makedirs(mount_dir, exist_ok=True)
+    load_fs_config(device_info['TYPE'])
+
+    log.debug("mounting device '%s' in '%s'", dev, mount_dir)
+    mount_device(dev, mount_dir, AUTOMOUNT_OPTS, AUTOMOUNT_TYPE)
+
+
+if __name__ == "__main__":
+    main()
