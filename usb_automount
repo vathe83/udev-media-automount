@@ -5,7 +5,7 @@ Tutorial to automount a usb: https://wiki.archlinux.org/title/udev
 
 This python script is a translation of the shell script `media-automount`
 from github repo 'https://github.com/Ferk/udev-media-automount'.
-include: 
+include:
  - /usr/lib/systemd/system/media-automount@.service
  - /usr/lib/udev/rules.d/99-media-automount.rules
  - /usr/bin/usb_automount
@@ -15,8 +15,17 @@ deploy:
 monitor:
 - udevadm monitor -u -s block
 - journalctl -f
+- findmnt -n -o SOURCE /media/targets
+- findmnt -n -o SOURCE /home/target1
 
 Find usb serial with 'udevadm info -a  -n /dev/<DISC> | grep -i serial'
+
+TODO:
+- there will be a problem if suddenly the usb is off,
+  home directory will have opened files and will not umount the overlay
+  and we do not know to which state will be
+- We have to make sure that mount directory is always the same, check dups
+- The loading of config is untested
 
 Usage:
     usb_automount [--debug] <dev>
@@ -59,17 +68,19 @@ AUTOMOUNT_TYPE = 'auto'
 CONFDIR = '/etc/media-automount.d'
 
 # Directory to use as parent media dir for mountpoints
-MEDIADIR = '/media'
+MNT_DIR = '/media'
+MNT_SUBDIR_NAME = "targets"
 
 logging.basicConfig(format='%(message)s')
 log = logging.getLogger(NAME)
 log.setLevel(logging.INFO)
 
 
-def execute(cmd: str, **kwargs) -> subprocess.run:
+def execute(cmd: str, timeout=3, **kwargs) -> subprocess.run:
     cmd_list = cmd.split()
     log.debug("Execute>>> %s", cmd_list)
-    return subprocess.run(cmd_list, shell=False, check=False,
+    return subprocess.run(cmd_list,
+                          shell=False, check=False, text=True, timeout=timeout,
                           stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                           **kwargs)
 
@@ -96,7 +107,7 @@ def check_root_fs(dev: str) -> None:
     sys.exit(1) if dev is used as rootfs.
     """
     res = execute("findmnt -n -o SOURCE /")
-    root_dev = res.stdout.strip().decode("utf-8")
+    root_dev = res.stdout.strip()
     if dev in root_dev:
         log.error("'%s' is used as rootfs, automount won't manage it.", dev)
         sys.exit(1)
@@ -110,19 +121,25 @@ def device_exists(dev: str) -> bool:
 
 
 def unmount_device(dev: str) -> bool:
-    result = execute(f"umount {dev}")
+    cmd = f"umount {dev}"
+    result = execute(cmd)
     if result.returncode != 0:
         log.error("Error unmounting '%s' errcode: %s", dev, result.returncode)
-        log.error("Command was: umount '%s'", dev)
+        log.error("Command was: %s", cmd)
     # Reverse output since 0 in linux means successful but failed in python
     return not bool(result.returncode)
 
 
 def cleanup_mountpoints() -> None:
-    for d in os.listdir(MEDIADIR):
-        path = os.path.join(MEDIADIR, d)
-        if os.path.isdir(path) and not os.path.ismount(path) and not in_fstab(path):
-            os.rmdir(path)
+    for d in os.listdir(MNT_DIR):
+        if not d.startswith(MNT_SUBDIR_NAME):
+            continue
+        path = os.path.join(MNT_DIR, d)
+        if os.path.isdir(path) and not in_fstab(path):
+            if not os.path.ismount(path):
+                os.rmdir(path)
+            else:
+                log.warning("Directory %s is still mounted", path)
 
 
 def in_fstab(path: str) -> bool:
@@ -132,7 +149,7 @@ def in_fstab(path: str) -> bool:
 
 def get_device_info(dev: str) -> dict:
     result = execute(f"blkid -po export {dev}")
-    return dict(line.split('=') for line in result.stdout.decode("utf-8").strip().split('\n'))
+    return dict(line.split('=') for line in result.stdout.strip().split('\n'))
 
 
 def already_in_fstab(uuid: str, label: str, dev: str) -> bool:
@@ -149,10 +166,14 @@ def already_in_fstab(uuid: str, label: str, dev: str) -> bool:
     return False
 
 
-def get_mount_dir(label: str, dev_type: str) -> str:
-    base_dir = os.path.join(MEDIADIR, f"{label}.{dev_type}")
+def get_new_mount_dir() -> str:
+    # Deprecated:
+    #   label = device_info.get('LABEL', os.path.basename(dev))
+    #   type = device_info['TYPE']
+    #   base_dir = os.path.join(MNT_DIR, f"{label}.{dev_type}")
+    base_dir = os.path.join(MNT_DIR, MNT_SUBDIR_NAME)
     if os.path.exists(base_dir) and os.path.ismount(base_dir):
-        dups = len([d for d in os.listdir(MEDIADIR) if d.startswith(f"{label}.{dev_type}")])
+        dups = len([d for d in os.listdir(MNT_DIR) if d.startswith(MNT_SUBDIR_NAME)])
         return f"{base_dir}_{dups}"
     return base_dir
 
@@ -164,7 +185,7 @@ def load_fs_config(fs_type):
         with open(config_file, "r", encoding="utf-8") as f:
             import pdb; pdb.set_trace()
             # pdb: check func typings and if execute works
-            cmd = f.read() 
+            cmd = f.read()
             res = execute(cmd)
 
 
@@ -186,7 +207,7 @@ def mount_device(dev: str, mount_dir: str, opts: str, dev_type: str) -> None:
 
 def notify_user(mount_dir):
     result = execute("ps au")
-    for line in result.stdout.decode("utf-8").splitlines():
+    for line in result.stdout.splitlines():
         if 'xinit' in line:
             username = line.split()[0]
             display = ':0'
@@ -210,9 +231,10 @@ def main():
     check_root_fs(dev)
 
     if not device_exists(dev):
+        execute("provide_clean_home --user target1 --umount-home")
         if execute(f"grep {dev} {MTAB_FILE}").returncode == 0:
             log.debug("'%s' device removed, unmounting and cleaning '%s'",
-                      dev, MEDIADIR)
+                      dev, MNT_DIR)
             unmount_device(dev)
         cleanup_mountpoints()
         sys.exit(0)
@@ -228,13 +250,14 @@ def main():
                   dev)
         sys.exit(0)
 
-    mount_dir = get_mount_dir(device_info.get('LABEL', os.path.basename(dev)),
-                              device_info['TYPE'])
+    mount_dir = get_new_mount_dir()
     os.makedirs(mount_dir, exist_ok=True)
     load_fs_config(device_info['TYPE'])
 
     log.debug("mounting device '%s' in '%s'", dev, mount_dir)
     mount_device(dev, mount_dir, AUTOMOUNT_OPTS, AUTOMOUNT_TYPE)
+
+    execute(f"provide_clean_home --user target1 --usb-mnt-dir {mount_dir} --remount-home")
 
 
 if __name__ == "__main__":
